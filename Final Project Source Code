@@ -12,9 +12,6 @@ Objectives:
     4) Compare Naive NumPy, DSL no optimization, and DSL + CSE using runtime,
        memory usage, traversal counts, and correctness
 
-Run:
-    python CS790finalv4_styled.py
-    python CS790finalv4_styled.py --quick
 """
 
 from __future__ import annotations
