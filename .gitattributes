@@ -1,2 +1,349 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+"""
+Comp Sci 790 Final Project: Python-Embedded DSL for Biosignal Preprocessing
+
+Devin SaJeun DuCharme Spring 2026
+
+Objectives:
+    1) Implement a lightweight Python-embedded domain-specific language (DSL)
+       for biosignal preprocessing workflows
+    2) Represent preprocessing operations as a directed acyclic graph (DAG)
+    3) Apply common subexpression elimination (CSE) so shared preprocessing
+       operations are reused across feature branches
+    4) Compare Naive NumPy, DSL no optimization, and DSL + CSE using runtime,
+       memory usage, traversal counts, and correctness
+
+Run:
+    python CS790finalv4_styled.py
+    python CS790finalv4_styled.py --quick
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Callable
+
+import argparse, hashlib, time, tracemalloc
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy import signal as scipy_signal
+
+
+# ~~~~ Imports and DSL Core ~~~~
+
+# Store each preprocessing operation as a DAG node
+@dataclass(frozen=True)
+class Node:
+    node_id: str
+    op: str
+    params: Tuple[Tuple[str, Any], ...]
+    parent: Optional[str]
+
+
+# Create a stable ID for repeated operations
+def stable_id(op: str, params: Dict[str, Any], parent: Optional[str]) -> str:
+    payload = repr((op, tuple(sorted(params.items())), parent)).encode("utf-8")
+    return hashlib.sha1(payload).hexdigest()[:12]
+
+
+# Track execution statistics during graph evaluation
+@dataclass
+class EvalStats:
+    node_evaluations: int = 0
+    cache_hits: int = 0
+    op_counts: Dict[str, int] = field(default_factory=dict)
+
+    def windowing_traversals(self) -> int:
+        return self.op_counts.get("window", 0)
+
+
+# Build the Python-embedded DSL pipeline
+class Pipeline:
+
+    def __init__(self, signal: np.ndarray):
+        self.signal = np.asarray(signal, dtype=float)
+        self.nodes: Dict[str, Node] = {}
+        root = stable_id("input", {"shape": self.signal.shape}, None)
+        self.nodes[root] = Node(root, "input", (("shape", self.signal.shape),), None)
+        self.current = root
+
+    def _add(self, op: str, **params: Any) -> "Pipeline":
+        nid = stable_id(op, params, self.current)
+        self.nodes.setdefault(
+            nid, Node(nid, op, tuple(sorted(params.items())), self.current)
+        )
+        self.current = nid
+        return self
+
+    # --- Fine-grained operations ---
+    def bandpass(self, low=20.0, high=450.0, fs=1000.0, order=4):
+        return self._add("bandpass", low=low, high=high, fs=fs, order=order)
+    def window(self, size=256, hop=128):
+        return self._add("window", size=size, hop=hop)
+    def rectify(self):        return self._add("rectify")
+    def square(self):         return self._add("square")
+    def mean_axis_last(self): return self._add("mean_axis_last")
+    def sqrt(self):           return self._add("sqrt")
+    def fft_mean(self):       return self._add("fft_mean")
+
+    # --- Composites: expand to fine-grained ops ---
+    def rms(self):      return self.square().mean_axis_last().sqrt()
+    def mean_abs(self): return self.rectify().mean_axis_last()
+
+    # --- Branch execution (entry point for shared upstream graphs) ---
+    def branch(self, features: List[str], optimize_cse=True,
+               stats: Optional[EvalStats] = None):
+        if stats is None:
+            stats = EvalStats()
+        shared_cache = {} if optimize_cse else None
+        out: Dict[str, np.ndarray] = {}
+        for feat in features:
+            p = self.copy()
+            if   feat == "rms":      p.rms()
+            elif feat == "mean_abs": p.mean_abs()
+            elif feat == "fft_mean": p.fft_mean()
+            else: raise ValueError(f"Unknown feature: {feat}")
+            out[feat] = p._eval(p.current, shared_cache, stats)
+        return out
+
+    def copy(self) -> "Pipeline":
+        new = object.__new__(Pipeline)
+        new.signal, new.nodes, new.current = self.signal, dict(self.nodes), self.current
+        return new
+
+    # --- Recursive evaluator with instrumentation ---
+    def _eval(self, nid: str, cache: Optional[Dict[str, np.ndarray]],
+              stats: EvalStats) -> np.ndarray:
+        if cache is not None and nid in cache:
+            stats.cache_hits += 1
+            return cache[nid]
+        node = self.nodes[nid]
+        stats.node_evaluations += 1
+        stats.op_counts[node.op] = stats.op_counts.get(node.op, 0) + 1
+
+        if node.op == "input":
+            result = self.signal
+        else:
+            parent_result = self._eval(node.parent, cache, stats)
+            result = _run_op(node.op, parent_result, dict(node.params))
+        if cache is not None:
+            cache[nid] = result
+        return result
+
+
+# ~~~~ Biosignal Preprocessing Operations ~~~~
+
+# Create Butterworth bandpass filter coefficients
+def _butter_bp(low, high, fs, order):
+    nyq = 0.5 * fs
+    return scipy_signal.butter(order, [low/nyq, high/nyq], btype="band")
+
+# Create overlapping sliding windows
+def _windows(sig: np.ndarray, size: int, hop: int) -> np.ndarray:
+    arr = np.asarray(sig)
+    if arr.ndim == 1:
+        return np.lib.stride_tricks.sliding_window_view(arr, size)[::hop].copy()
+    return np.lib.stride_tricks.sliding_window_view(arr, size, axis=1)[:, ::hop, :].copy()
+
+
+# Run each supported preprocessing operation
+def _run_op(op: str, x: np.ndarray, params: Dict[str, Any]) -> np.ndarray:
+    if op == "bandpass":
+        b, a = _butter_bp(params["low"], params["high"], params["fs"], params["order"])
+        return scipy_signal.filtfilt(b, a, x, axis=-1)
+    if op == "window":         return _windows(x, params["size"], params["hop"])
+    if op == "rectify":        return np.abs(x)
+    if op == "square":         return x * x
+    if op == "mean_axis_last": return np.mean(x, axis=-1)
+    if op == "sqrt":           return np.sqrt(x)
+    if op == "fft_mean":       return np.mean(np.abs(np.fft.rfft(x, axis=-1)), axis=-1)
+    raise ValueError(f"Unknown op: {op}")
+
+
+# ~~~~ Synthetic EMG Signal Generation ~~~~
+
+# Generate single-channel synthetic EMG signal
+def make_emg(n_samples=200_000, seed=33, fs=1000.0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    t = np.arange(n_samples) / fs
+    bursts = scipy_signal.savgol_filter(
+        (np.sin(2*np.pi*0.5*t) > 0).astype(float), 51, 3
+    )
+    carrier = rng.normal(size=n_samples) * 0.5
+    b, a = _butter_bp(20, 450, fs, 4)
+    emg = scipy_signal.filtfilt(b, a, carrier) * bursts * 2.0
+    emg += 0.05 * np.sin(2*np.pi*60*t) + 0.05 * rng.normal(size=n_samples)
+    return emg
+
+# Generate multi-channel synthetic EMG signal
+def make_multichannel_emg(n_samples=200_000, n_channels=8, seed=33, fs=1000.0):
+    return np.stack([make_emg(n_samples, seed+c, fs) for c in range(n_channels)])
+
+
+# ~~~~ Naive NumPy Baseline and DSL Runner ~~~~
+
+# Feature functions used by the NumPy baseline
+FEATURE_FUNCS: Dict[str, Callable[[np.ndarray], np.ndarray]] = {
+    "rms":      lambda w: np.sqrt(np.mean(w**2, axis=-1)),
+    "fft_mean": lambda w: np.mean(np.abs(np.fft.rfft(w, axis=-1)), axis=-1),
+    "mean_abs": lambda w: np.mean(np.abs(w), axis=-1),
+}
+
+# Naive baseline intentionally repeats preprocessing for each feature
+def naive_baseline(signal, size, hop, features, fs=1000.0):
+    out = {}
+    for feat in features:
+        filt = _run_op("bandpass", signal, {"low":20.0,"high":450.0,"fs":fs,"order":4})
+        w = _windows(filt, size, hop)
+        out[feat] = FEATURE_FUNCS[feat](w)
+    return out
+
+# Run DSL pipeline with or without CSE optimization
+def dsl_run(signal, size, hop, features, optimize_cse, fs=1000.0):
+    stats = EvalStats()
+    out = (Pipeline(signal)
+           .bandpass(20.0, 450.0, fs, 4)
+           .window(size=size, hop=hop)
+           .branch(features, optimize_cse=optimize_cse, stats=stats))
+    return out, stats
+
+
+# ~~~~ Benchmarking and Experiment Setup ~~~~
+
+# Measure runtime and peak memory
+def measure(func, repeats=5):
+    runtimes, peaks, last = [], [], None
+    for _ in range(repeats):
+        tracemalloc.start()
+        t0 = time.perf_counter()
+        last = func()
+        t1 = time.perf_counter()
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        runtimes.append((t1 - t0) * 1000)
+        peaks.append(peak / (1024 * 1024))
+    return {
+        "runtime_ms_mean": float(np.mean(runtimes)),
+        "runtime_ms_std":  float(np.std(runtimes)),
+        "peak_memory_mb_mean": float(np.mean(peaks)),
+        "peak_memory_mb_std":  float(np.std(peaks)),
+        "result": last,
+    }
+
+# Check if DSL output matches Naive NumPy output
+def correct(ref, test, atol=1e-8):
+    return (set(ref.keys()) == set(test.keys())
+            and all(np.allclose(ref[k], test[k], atol=atol) for k in ref))
+
+
+# Run one benchmark scenario
+def run_scenario(name, signal, n, size, hop, features, repeats):
+    naive = measure(lambda: naive_baseline(signal, size, hop, features), repeats)
+
+    def dsl(cse):
+        holder = {}
+        def runner():
+            o, s = dsl_run(signal, size, hop, features, cse)
+            holder["s"] = s
+            return o
+        m = measure(runner, repeats)
+        m["stats"] = holder["s"]
+        return m
+
+    d_no, d_cse = dsl(False), dsl(True)
+
+    ref = naive["result"]
+    rows = []
+    for label, m, trav in [
+        ("Naive NumPy", naive, len(features)),
+        ("DSL no-opt",  d_no,  d_no["stats"].windowing_traversals()),
+        ("DSL +CSE",    d_cse, d_cse["stats"].windowing_traversals()),
+    ]:
+        rows.append({
+            "scenario": name, "n_samples": n, "method": label,
+            "runtime_ms_mean": m["runtime_ms_mean"],
+            "runtime_ms_std":  m["runtime_ms_std"],
+            "peak_memory_mb_mean": m["peak_memory_mb_mean"],
+            "peak_memory_mb_std":  m["peak_memory_mb_std"],
+            "window_traversals": trav,
+            "correct_vs_naive": correct(ref, m["result"]),
+        })
+    return rows
+
+
+# ~~~~ Plot Results ~~~~
+
+# Plot runtime scaling
+def plot_runtime(df, title, path):
+    plt.figure(figsize=(9, 5))
+    for m in df["method"].unique():
+        sub = df[df["method"] == m].sort_values("n_samples")
+        plt.plot(sub["n_samples"], sub["runtime_ms_mean"], marker="o", label=m)
+    plt.xlabel("Signal length (samples per channel)")
+    plt.ylabel("Runtime (ms)")
+    plt.title(title); plt.legend(); plt.tight_layout()
+    plt.savefig(path, dpi=200); plt.close()
+
+# Plot traversal count at largest signal size
+def plot_bar(df, ycol, ylabel, title, path):
+    largest = df["n_samples"].max()
+    sub = df[df["n_samples"] == largest]
+    plt.figure(figsize=(8, 5))
+    plt.bar(sub["method"], sub[ycol])
+    plt.ylabel(ylabel); plt.title(f"{title} (n={largest})")
+    plt.xticks(rotation=20, ha="right"); plt.tight_layout()
+    plt.savefig(path, dpi=200); plt.close()
+
+
+# ~~~~ Main Program Execution ~~~~
+
+# Main execution function
+def main():
+    print("Starting CS790 biosignal DSL final project...")
+
+    p = argparse.ArgumentParser()
+    p.add_argument("--repeats", type=int, default=5)
+    p.add_argument("--out_dir", type=str, default="results")
+    p.add_argument("--quick", action="store_true")
+    args = p.parse_args()
+    out = Path(args.out_dir); out.mkdir(exist_ok=True, parents=True)
+
+    sizes_single = (20_000, 50_000) if args.quick else (50_000, 100_000, 200_000, 400_000)
+    sizes_multi  = (10_000, 25_000) if args.quick else (50_000, 100_000, 200_000)
+    n_channels = 8
+    features = ["rms", "fft_mean", "mean_abs"]
+
+    rows = []
+    print("Single-channel scenario...")
+    for n in sizes_single:
+        sig = make_emg(n_samples=n, seed=33)
+        rows += run_scenario("single_channel", sig, n, 256, 128, features, args.repeats)
+
+    print("Multi-channel scenario...")
+    for n in sizes_multi:
+        sig = make_multichannel_emg(n_samples=n, n_channels=n_channels, seed=33)
+        rows += run_scenario(f"multichannel_{n_channels}ch", sig, n, 256, 128,
+                             features, args.repeats)
+
+    print("Creating results table...")
+    df = pd.DataFrame(rows)
+
+    df_s = df[df["scenario"] == "single_channel"]
+    df_m = df[df["scenario"] == f"multichannel_{n_channels}ch"]
+
+    plot_runtime(df_s, "Single-channel: runtime scaling", out / "single_runtime.png")
+    plot_runtime(df_m, f"Multi-channel ({n_channels}ch): runtime scaling",
+                 out / "multi_runtime.png")
+    plot_bar(df_s, "window_traversals", "Windowing traversals (measured)",
+             "Single-channel: traversals", out / "single_traversals.png")
+    plot_bar(df_m, "window_traversals", "Windowing traversals (measured)",
+             f"Multi-channel ({n_channels}ch): traversals",
+             out / "multi_traversals.png")
+
+    print("\n=== Results ===")
+    print(df.round(3).to_string(index=False))
+    print(f"\nWrote: {out}/")
+
+
+if __name__ == "__main__":
+    main()
